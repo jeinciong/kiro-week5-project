@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 import type { EventStatus, LocationType } from "@/lib/supabase/types";
+import { sendEventCancelledEmail } from "@/lib/email";
 
 async function requireOrganizer() {
   const supabase = await createClient();
@@ -73,19 +74,50 @@ export async function updateEvent(eventId: string, formData: FormData) {
 export async function cancelEvent(eventId: string) {
   const { supabase, userId } = await requireOrganizer();
 
-  const { error } = await supabase
+  const { data: event, error } = await supabase
     .from("events")
     .update({ status: "cancelled" })
     .eq("id", eventId)
-    .eq("organizer_id", userId);
+    .eq("organizer_id", userId)
+    .select("title")
+    .single();
 
   if (error) {
     return { error: error.message };
   }
 
+  await notifyAttendeesOfCancellation(eventId, event.title);
+
   revalidatePath("/organizer");
   revalidatePath(`/organizer/events/${eventId}`);
   return { success: true };
+}
+
+async function notifyAttendeesOfCancellation(eventId: string, title: string) {
+  const { createAdminClient } = await import("@/lib/supabase/admin");
+  const admin = createAdminClient();
+  if (!admin) {
+    console.warn(
+      "[email] SUPABASE_SERVICE_ROLE_KEY not set - skipping cancellation notices"
+    );
+    return;
+  }
+
+  const { data: rsvps } = await admin
+    .from("rsvps")
+    .select("attendee_id")
+    .eq("event_id", eventId)
+    .in("status", ["confirmed", "waitlisted"]);
+
+  for (const rsvp of rsvps ?? []) {
+    const { data: userResult } = await admin.auth.admin.getUserById(
+      rsvp.attendee_id
+    );
+    const email = userResult?.user?.email;
+    if (email) {
+      await sendEventCancelledEmail({ to: email, eventTitle: title });
+    }
+  }
 }
 
 export async function duplicateEvent(eventId: string) {
